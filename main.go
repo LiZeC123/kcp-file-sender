@@ -30,6 +30,13 @@ const (
 
 	maxNameLen   = 65535
 	maxFileCount = 1000000
+
+	// 客户端在收完所有文件并写盘后发送的确认字节
+	ackDone = 'D'
+	// 服务端等待客户端确认的超时
+	serverAckTimeout = 120 * time.Second
+	// 客户端在 recvFile 中的单次读超时, 避免服务端异常时永久阻塞
+	clientReadTimeout = 120 * time.Second
 )
 
 // ---------------- 参数 ----------------
@@ -184,13 +191,13 @@ func scanFiles(root string, minSize int64) ([]FileEntry, error) {
 }
 
 func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
-	defer conn.Close()
 	cfg.apply(conn)
 
-	// 1) 读握手字节 (修复之前的 bug)
+	// 1) 读握手字节 (触发 AcceptKCP 返回后必须读掉)
 	hs := make([]byte, 1)
 	if _, err := io.ReadFull(conn, hs); err != nil {
 		log.Printf("握手失败: %v", err)
+		conn.Close()
 		return
 	}
 	log.Printf("握手完成, 发送文件列表 (%d 个)", len(files))
@@ -198,19 +205,21 @@ func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
 	// 2) 发送文件列表
 	if err := sendFileList(conn, files); err != nil {
 		log.Printf("发送列表失败: %v", err)
+		conn.Close()
 		return
 	}
 
 	// 3) 读取客户端请求
-	// 格式: [count:4] + [seq:4]*count
 	reqHdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, reqHdr); err != nil {
 		log.Printf("读取请求头失败: %v", err)
+		conn.Close()
 		return
 	}
 	count := binary.BigEndian.Uint32(reqHdr)
 	if count == 0 || count > maxFileCount {
 		log.Printf("非法请求数量: %d", count)
+		conn.Close()
 		return
 	}
 	seqs := make([]uint32, count)
@@ -218,6 +227,7 @@ func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
 	for i := range seqs {
 		if _, err := io.ReadFull(conn, seqBuf); err != nil {
 			log.Printf("读取序号失败: %v", err)
+			conn.Close()
 			return
 		}
 		seqs[i] = binary.BigEndian.Uint32(seqBuf)
@@ -237,6 +247,7 @@ func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
 		n, err := sendFile(conn, f)
 		if err != nil {
 			log.Printf("发送 %s 失败: %v", f.RelPath, err)
+			conn.Close()
 			return
 		}
 		totalSent += n
@@ -245,6 +256,23 @@ func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
 	log.Printf("会话完成: %d 个文件, %d 字节, 用时 %v, 平均 %.2f MiB/s",
 		len(seqs), totalSent, elapsed,
 		float64(totalSent)/elapsed.Seconds()/1024/1024)
+
+	// 5) 阻塞等待客户端确认。
+	//    客户端只有在按精确长度收完所有文件并写盘之后才会发送 ackDone,
+	//    所以收到它就等于确认数据已全部交付, 此时才可安全关闭连接。
+	log.Printf("等待客户端确认...")
+	ack := make([]byte, 1)
+	conn.SetReadDeadline(time.Now().Add(serverAckTimeout))
+	if _, err := io.ReadFull(conn, ack); err != nil {
+		log.Printf("等待客户端确认失败: %v", err)
+	} else if ack[0] == ackDone {
+		log.Printf("收到客户端完成确认, 数据已全部交付")
+	} else {
+		log.Printf("收到未知确认字节: %d", ack[0])
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	conn.Close()
 }
 
 func sendFileList(conn io.Writer, files []FileEntry) error {
@@ -363,7 +391,7 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		return
 	}
 
-	// 解析序号, 去重并保持输入顺序
+	// 解析序号
 	parts := strings.Fields(line)
 	var seqs []uint32
 	seen := make(map[int]bool)
@@ -410,10 +438,19 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		totalBytes += size
 	}
 
+	// 所有文件已收完并写盘, 通知服务端可以安全关闭
+	// 这是服务端确认数据全部交付的唯一依据
+	if _, err := conn.Write([]byte{ackDone}); err != nil {
+		log.Printf("发送完成确认失败: %v", err)
+	}
+
 	elapsed := time.Since(startAll)
 	fmt.Printf("\n全部完成: %d 个文件, %d 字节 (%.2f MiB), 用时 %v, 平均 %.2f MiB/s\n",
 		len(seqs), totalBytes, float64(totalBytes)/1024/1024,
 		elapsed, float64(totalBytes)/elapsed.Seconds()/1024/1024)
+
+	// 给 ackDone 一点时间通过 KCP 送达服务端, 然后退出
+	time.Sleep(1 * time.Second)
 }
 
 func recvFileList(conn io.Reader) ([]FileEntry, error) {
@@ -452,7 +489,7 @@ func recvFileList(conn io.Reader) ([]FileEntry, error) {
 	return files, nil
 }
 
-func recvFile(conn io.Reader, outDir string) (string, int64, error) {
+func recvFile(conn *kcp.UDPSession, outDir string) (string, int64, error) {
 	// 文件头: [nameLen:2][name:N][size:8]
 	nhdr := make([]byte, 2)
 	if _, err := io.ReadFull(conn, nhdr); err != nil {
@@ -493,13 +530,15 @@ func recvFile(conn io.Reader, outDir string) (string, int64, error) {
 		if size-received < want {
 			want = size - received
 		}
+		// 单次读超时, 服务端异常时客户端不会永久阻塞
+		conn.SetReadDeadline(time.Now().Add(clientReadTimeout))
 		n, err := io.ReadFull(conn, buf[:want])
 		if n > 0 {
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return "", 0, werr
 			}
 			received += int64(n)
-			if time.Since(lastUpdate) >= time.Second {
+			if time.Since(lastUpdate) >= 100*time.Millisecond {
 				printProgress(baseName, received, size, start)
 				lastUpdate = time.Now()
 			}
@@ -514,6 +553,7 @@ func recvFile(conn io.Reader, outDir string) (string, int64, error) {
 			return "", 0, err
 		}
 	}
+	conn.SetReadDeadline(time.Time{})
 	printProgress(baseName, received, size, start)
 	fmt.Println()
 	return localPath, received, nil
@@ -550,7 +590,17 @@ func printProgress(name string, done, total int64, start time.Time) {
 	if frac < 0 {
 		frac = 0
 	}
+
+	finished := done >= total
+	pct := frac * 100
+	if finished {
+		pct = 100.0
+	}
+
 	filled := int(frac * barWidth)
+	if finished {
+		filled = barWidth
+	}
 	bar := strings.Repeat("=", filled)
 	if filled < barWidth {
 		bar += ">" + strings.Repeat(" ", barWidth-filled-1)
@@ -563,13 +613,13 @@ func printProgress(name string, done, total int64, start time.Time) {
 	}
 
 	var eta string
-	if rate > 0 && done < total {
+	if finished {
+		eta = "00:00"
+	} else if rate > 0 {
 		rem := float64(total-done) / (rate * 1024 * 1024)
 		m := int(rem) / 60
 		s := int(rem) % 60
 		eta = fmt.Sprintf("%02d:%02d", m, s)
-	} else if done >= total {
-		eta = "00:00"
 	} else {
 		eta = "--:--"
 	}
@@ -580,5 +630,5 @@ func printProgress(name string, done, total int64, start time.Time) {
 	}
 
 	fmt.Printf("\r%-40s [%s] %5.1f%%  %6.2f MiB/s  ETA %s",
-		displayName, bar, frac*100, rate, eta)
+		displayName, bar, pct, rate, eta)
 }
