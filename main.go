@@ -538,7 +538,7 @@ func recvFile(conn *kcp.UDPSession, outDir string) (string, int64, error) {
 				return "", 0, werr
 			}
 			received += int64(n)
-			if time.Since(lastUpdate) >= 100*time.Millisecond {
+			if time.Since(lastUpdate) >= 1000*time.Millisecond {
 				printProgress(baseName, received, size, start)
 				lastUpdate = time.Now()
 			}
@@ -629,6 +629,6 @@ func printProgress(name string, done, total int64, start time.Time) {
 		displayName = "..." + displayName[len(displayName)-37:]
 	}
 
-	fmt.Printf("\r%-40s [%s] %5.1f%%  %6.2f MiB/s  ETA %s",
-		displayName, bar, pct, rate, eta)
+	fmt.Printf("\r%-40s [%s] %5.1f%%  %6.2f MiB/s ELP %v min ETA %s",
+		displayName, bar, pct, rate, elapsed, eta)
 }
