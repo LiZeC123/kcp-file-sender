@@ -621,9 +621,7 @@ func printProgress(name string, done, total int64, start time.Time) {
 		eta = "00:00"
 	} else if rate > 0 {
 		rem := float64(total-done) / (rate * 1024 * 1024)
-		m := int(rem) / 60
-		s := int(rem) % 60
-		eta = fmt.Sprintf("%02d:%02d", m, s)
+		eta = formatTime(rem)
 	} else {
 		eta = "--:--"
 	}
@@ -633,6 +631,12 @@ func printProgress(name string, done, total int64, start time.Time) {
 		displayName = "..." + displayName[len(displayName)-37:]
 	}
 
-	fmt.Printf("\r%-40s [%s] %5.1f%%  %6.2f MiB/s ELP %v min ETA %s",
-		displayName, bar, pct, rate, elapsed, eta)
+	fmt.Printf("\r%-40s [%s] %5.1f%%  %6.2f MiB/s ELP %s ETA %s",
+		displayName, bar, pct, rate, formatTime(elapsed), eta)
+}
+
+func formatTime(sec float64) string {
+	m := int(sec) / 60
+	s := int(sec) % 60
+	return fmt.Sprintf("%02d:%02d", m, s)
 }
