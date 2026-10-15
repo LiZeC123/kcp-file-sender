@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultPort      = 12080
-	defaultFECData   = 0	// 由于丢包率过高, 因此不开启FEC
+	defaultFECData   = 0 // 由于丢包率过高, 因此不开启FEC
 	defaultFECParity = 0
 	defaultInterval  = 10
 	defaultResend    = 2
@@ -387,6 +387,7 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
 	if line == "" || line == "q" || line == "quit" || line == "exit" {
+		writeAckDone(conn)
 		log.Println("已退出")
 		return
 	}
@@ -440,17 +441,12 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 
 	// 所有文件已收完并写盘, 通知服务端可以安全关闭
 	// 这是服务端确认数据全部交付的唯一依据
-	if _, err := conn.Write([]byte{ackDone}); err != nil {
-		log.Printf("发送完成确认失败: %v", err)
-	}
+	writeAckDone(conn)
 
 	elapsed := time.Since(startAll)
 	fmt.Printf("\n全部完成: %d 个文件, %d 字节 (%.2f MiB), 用时 %v, 平均 %.2f MiB/s\n",
 		len(seqs), totalBytes, float64(totalBytes)/1024/1024,
 		elapsed, float64(totalBytes)/elapsed.Seconds()/1024/1024)
-
-	// 给 ackDone 一点时间通过 KCP 送达服务端, 然后退出
-	time.Sleep(1 * time.Second)
 }
 
 func recvFileList(conn io.Reader) ([]FileEntry, error) {
@@ -557,6 +553,14 @@ func recvFile(conn *kcp.UDPSession, outDir string) (string, int64, error) {
 	printProgress(baseName, received, size, start)
 	fmt.Println()
 	return localPath, received, nil
+}
+
+func writeAckDone(conn *kcp.UDPSession) {
+	if _, err := conn.Write([]byte{ackDone}); err != nil {
+		log.Printf("发送完成确认失败: %v", err)
+	}
+	// 给 ackDone 一点时间通过 KCP 送达服务端, 然后退出
+	time.Sleep(1 * time.Second)
 }
 
 // uniquePath 在 dir 下为 baseName 找一个不冲突的名字:
