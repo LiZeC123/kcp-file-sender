@@ -33,8 +33,10 @@ const (
 
 	// 客户端在收完所有文件并写盘后发送的确认字节
 	ackDone = 'D'
-	// 服务端等待客户端确认的超时
+	// 服务端等待客户端完成确认的超时
 	serverAckTimeout = 120 * time.Second
+	// 服务端读取客户端请求 (请求头 + 文件序号 + offset) 的超时
+	serverRequestTimeout = 120 * time.Second
 	// 客户端在 recvFile 中的单次读超时, 避免服务端异常时永久阻塞
 	clientReadTimeout = 120 * time.Second
 )
@@ -62,6 +64,21 @@ type FileEntry struct {
 	RelPath string // 相对路径, 斜杠分隔
 	AbsPath string // 服务端本地绝对路径
 	Size    int64
+}
+
+// fileReq 客户端请求中的单条记录
+type fileReq struct {
+	Seq    uint32
+	Offset int64
+}
+
+// pending 客户端待下载文件的本地状态
+type pending struct {
+	Seq       uint32
+	Offset    int64
+	LocalPath string
+	Size      int64
+	RelPath   string
 }
 
 func main() {
@@ -209,42 +226,69 @@ func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
 		return
 	}
 
-	// 3) 读取客户端请求
+	// 3) 读取客户端请求 (请求头 + 序号/offset), 整个请求读取阶段设置超时
+	conn.SetReadDeadline(time.Now().Add(serverRequestTimeout))
+
 	reqHdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, reqHdr); err != nil {
-		log.Printf("读取请求头失败: %v", err)
+		log.Printf("读取请求头失败 (或超时): %v", err)
 		conn.Close()
 		return
 	}
 	count := binary.BigEndian.Uint32(reqHdr)
-	if count == 0 || count > maxFileCount {
+
+	// count == 0 表示客户端主动取消或没有任何文件需要下载
+	if count == 0 {
+		log.Printf("客户端取消或无文件需要下载, 关闭连接")
+		conn.SetReadDeadline(time.Time{})
+		conn.Close()
+		return
+	}
+	if count > maxFileCount {
 		log.Printf("非法请求数量: %d", count)
 		conn.Close()
 		return
 	}
-	seqs := make([]uint32, count)
-	seqBuf := make([]byte, 4)
-	for i := range seqs {
-		if _, err := io.ReadFull(conn, seqBuf); err != nil {
-			log.Printf("读取序号失败: %v", err)
+
+	reqs := make([]fileReq, count)
+	reqBuf := make([]byte, 12) // [seq:4][offset:8]
+	for i := range reqs {
+		if _, err := io.ReadFull(conn, reqBuf); err != nil {
+			log.Printf("读取请求条目失败: %v", err)
 			conn.Close()
 			return
 		}
-		seqs[i] = binary.BigEndian.Uint32(seqBuf)
+		reqs[i].Seq = binary.BigEndian.Uint32(reqBuf[0:4])
+		reqs[i].Offset = int64(binary.BigEndian.Uint64(reqBuf[4:12]))
+	}
+
+	// 请求已读完, 取消读超时
+	conn.SetReadDeadline(time.Time{})
+
+	// 校验
+	for _, r := range reqs {
+		if int(r.Seq) >= len(files) {
+			log.Printf("序号 %d 越界, 关闭连接", r.Seq)
+			conn.Close()
+			return
+		}
+		f := files[r.Seq]
+		if r.Offset < 0 || r.Offset > f.Size {
+			log.Printf("序号 %d (%s) 的 offset %d 非法 (size=%d), 关闭连接",
+				r.Seq, f.RelPath, r.Offset, f.Size)
+			conn.Close()
+			return
+		}
 	}
 
 	log.Printf("客户端请求 %d 个文件", count)
 
-	// 4) 逐个发送
+	// 4) 逐个发送 (从各自 offset 开始)
 	startAll := time.Now()
 	var totalSent int64
-	for _, seq := range seqs {
-		if int(seq) >= len(files) {
-			log.Printf("序号 %d 越界, 跳过", seq)
-			continue
-		}
-		f := files[seq]
-		n, err := sendFile(conn, f)
+	for _, r := range reqs {
+		f := files[r.Seq]
+		n, err := sendFileFrom(conn, f, r.Offset)
 		if err != nil {
 			log.Printf("发送 %s 失败: %v", f.RelPath, err)
 			conn.Close()
@@ -253,13 +297,11 @@ func handleClient(conn *kcp.UDPSession, files []FileEntry, cfg KCPConfig) {
 		totalSent += n
 	}
 	elapsed := time.Since(startAll)
-	log.Printf("会话完成: %d 个文件, %d 字节, 用时 %v, 平均 %.2f MiB/s",
-		len(seqs), totalSent, elapsed,
+	log.Printf("会话完成: %d 个文件, 本次共 %d 字节, 用时 %v, 平均 %.2f MiB/s",
+		len(reqs), totalSent, elapsed,
 		float64(totalSent)/elapsed.Seconds()/1024/1024)
 
-	// 5) 阻塞等待客户端确认。
-	//    客户端只有在按精确长度收完所有文件并写盘之后才会发送 ackDone,
-	//    所以收到它就等于确认数据已全部交付, 此时才可安全关闭连接。
+	// 5) 阻塞等待客户端确认
 	log.Printf("等待客户端确认...")
 	ack := make([]byte, 1)
 	conn.SetReadDeadline(time.Now().Add(serverAckTimeout))
@@ -297,14 +339,22 @@ func sendFileList(conn io.Writer, files []FileEntry) error {
 	return nil
 }
 
-func sendFile(conn io.Writer, f FileEntry) (int64, error) {
+// sendFileFrom 从 offset 开始发送文件.
+// 文件头始终携带文件总大小, 便于客户端校验与进度显示.
+func sendFileFrom(conn io.Writer, f FileEntry, offset int64) (int64, error) {
 	file, err := os.Open(f.AbsPath)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 
-	// 文件头: [nameLen:2][name:N][size:8]
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return 0, err
+		}
+	}
+
+	// 文件头: [nameLen:2][name:N][size:8]  (size 为总大小)
 	nameBytes := []byte(f.RelPath)
 	hdr := make([]byte, 2+len(nameBytes)+8)
 	binary.BigEndian.PutUint16(hdr[0:2], uint16(len(nameBytes)))
@@ -314,12 +364,17 @@ func sendFile(conn io.Writer, f FileEntry) (int64, error) {
 		return 0, err
 	}
 
+	remaining := f.Size - offset
 	start := time.Now()
 	var sent int64
 	buf := make([]byte, 64*1024)
 	lastLog := start
-	for {
-		n, err := file.Read(buf)
+	for sent < remaining {
+		want := int64(len(buf))
+		if remaining-sent < want {
+			want = remaining - sent
+		}
+		n, err := file.Read(buf[:want])
 		if n > 0 {
 			if _, werr := conn.Write(buf[:n]); werr != nil {
 				return sent, werr
@@ -328,8 +383,10 @@ func sendFile(conn io.Writer, f FileEntry) (int64, error) {
 			if time.Since(lastLog) >= 2*time.Second {
 				elapsed := time.Since(start).Seconds()
 				rate := float64(sent) / elapsed / 1024 / 1024
-				log.Printf("  ↑ %s: %.1f%% (%.2f MiB/s)", f.RelPath,
-					float64(sent)*100/float64(f.Size), rate)
+				log.Printf("  ↑ %s: %.1f%% (本次 %.2f MiB/s)",
+					f.RelPath,
+					float64(offset+sent)*100/float64(f.Size),
+					rate)
 				lastLog = time.Now()
 			}
 		}
@@ -340,9 +397,10 @@ func sendFile(conn io.Writer, f FileEntry) (int64, error) {
 			return sent, err
 		}
 	}
+
 	elapsed := time.Since(start)
-	log.Printf("  ↑ %s 完成: %d 字节, %.2fs, 平均 %.2f MiB/s",
-		f.RelPath, sent, elapsed.Seconds(),
+	log.Printf("  ↑ %s 完成: 本次发送 %d 字节 (offset=%d, 累计 %d/%d), %.2fs, 平均 %.2f MiB/s",
+		f.RelPath, sent, offset, offset+sent, f.Size, elapsed.Seconds(),
 		float64(sent)/elapsed.Seconds()/1024/1024)
 	return sent, nil
 }
@@ -386,8 +444,10 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
+
 	if line == "" || line == "q" || line == "quit" || line == "exit" {
-		writeAckDone(conn)
+		// 发送 count=0 空请求, 通知服务端本次会话取消
+		sendCancel(conn)
 		log.Println("已退出")
 		return
 	}
@@ -414,38 +474,81 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		log.Fatal("未选择任何文件")
 	}
 
-	// 发送请求: [count:4] + [seq:4]*count
-	req := make([]byte, 4+4*len(seqs))
-	binary.BigEndian.PutUint32(req[0:4], uint32(len(seqs)))
-	for i, s := range seqs {
-		binary.BigEndian.PutUint32(req[4+4*i:], s)
+	// 本地预检: 计算每个选中文件的 localPath / offset, 跳过已完成或异常的
+	fmt.Println()
+	var pendingFiles []pending
+	var doneCount, warnCount int
+	for _, s := range seqs {
+		f := files[s]
+		baseName := filepath.Base(f.RelPath)
+		localPath := filepath.Join(outDir, baseName)
+
+		var localSize int64
+		if fi, err := os.Stat(localPath); err == nil && fi.Mode().IsRegular() {
+			localSize = fi.Size()
+		}
+
+		switch {
+		case localSize == f.Size:
+			fmt.Printf("  - 跳过 %s (本地已完成, %d 字节)\n", f.RelPath, localSize)
+			doneCount++
+			continue
+		case localSize > f.Size:
+			fmt.Printf("  ! 警告: 本地 %s 更大 (%d > %d), 跳过下载, 请手动处理\n",
+				localPath, localSize, f.Size)
+			warnCount++
+			continue
+		default:
+			pendingFiles = append(pendingFiles, pending{
+				Seq:       s,
+				Offset:    localSize,
+				LocalPath: localPath,
+				Size:      f.Size,
+				RelPath:   f.RelPath,
+			})
+		}
+	}
+
+	if len(pendingFiles) == 0 {
+		// 所有选中文件都已完成或被跳过, 通知服务端取消
+		sendCancel(conn)
+		fmt.Printf("\n无需下载 (已完成 %d, 跳过 %d)\n", doneCount, warnCount)
+		return
+	}
+
+	// 发送请求: [count:4] + [seq:4][offset:8]*count
+	req := make([]byte, 4+12*len(pendingFiles))
+	binary.BigEndian.PutUint32(req[0:4], uint32(len(pendingFiles)))
+	for i, p := range pendingFiles {
+		binary.BigEndian.PutUint32(req[4+12*i:], p.Seq)
+		binary.BigEndian.PutUint64(req[8+12*i:], uint64(p.Offset))
 	}
 	if _, err := conn.Write(req); err != nil {
 		log.Fatal("发送请求失败: ", err)
 	}
 
-	fmt.Printf("\n开始下载 %d 个文件...\n\n", len(seqs))
+	fmt.Printf("\n开始下载 %d 个文件 (已完成 %d, 跳过 %d)...\n\n",
+		len(pendingFiles), doneCount, warnCount)
 
 	startAll := time.Now()
 	var totalBytes int64
-	for i := 0; i < len(seqs); i++ {
-		localPath, size, err := recvFile(conn, outDir)
+	for _, p := range pendingFiles {
+		recv, err := recvFileAt(conn, p)
 		if err != nil {
 			fmt.Println()
 			log.Fatalf("接收文件失败: %v", err)
 		}
-		fmt.Printf("  ↓ 已保存 %s (%d 字节, %.2f MiB)\n",
-			localPath, size, float64(size)/1024/1024)
-		totalBytes += size
+		fmt.Printf("  ↓ 已保存 %s (本次 %d 字节, 本地累计 %d/%d, %.2f MiB)\n",
+			p.LocalPath, recv, p.Offset+recv, p.Size, float64(p.Size)/1024/1024)
+		totalBytes += recv
 	}
 
 	// 所有文件已收完并写盘, 通知服务端可以安全关闭
-	// 这是服务端确认数据全部交付的唯一依据
 	writeAckDone(conn)
 
 	elapsed := time.Since(startAll)
-	fmt.Printf("\n全部完成: %d 个文件, %d 字节 (%.2f MiB), 用时 %v, 平均 %.2f MiB/s\n",
-		len(seqs), totalBytes, float64(totalBytes)/1024/1024,
+	fmt.Printf("\n全部完成: 本次下载 %d 个文件, %d 字节 (%.2f MiB), 用时 %v, 平均 %.2f MiB/s\n",
+		len(pendingFiles), totalBytes, float64(totalBytes)/1024/1024,
 		elapsed, float64(totalBytes)/elapsed.Seconds()/1024/1024)
 }
 
@@ -485,74 +588,84 @@ func recvFileList(conn io.Reader) ([]FileEntry, error) {
 	return files, nil
 }
 
-func recvFile(conn *kcp.UDPSession, outDir string) (string, int64, error) {
+// recvFileAt 接收单个文件, 从 p.Offset 处开始追加写入 p.LocalPath.
+// 文件头里服务端携带的 size 必须等于 p.Size, 否则报错终止.
+func recvFileAt(conn *kcp.UDPSession, p pending) (int64, error) {
 	// 文件头: [nameLen:2][name:N][size:8]
 	nhdr := make([]byte, 2)
 	if _, err := io.ReadFull(conn, nhdr); err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	nameLen := binary.BigEndian.Uint16(nhdr)
 	nameBuf := make([]byte, nameLen)
 	if _, err := io.ReadFull(conn, nameBuf); err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	sizeBuf := make([]byte, 8)
 	if _, err := io.ReadFull(conn, sizeBuf); err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	remoteName := string(nameBuf)
 	size := int64(binary.BigEndian.Uint64(sizeBuf))
 	if size < 0 {
-		return "", 0, fmt.Errorf("非法文件大小: %d", size)
+		return 0, fmt.Errorf("非法文件大小: %d", size)
+	}
+	if size != p.Size {
+		return 0, fmt.Errorf("文件 %s 大小不一致: 服务端 %d, 预期 %d",
+			remoteName, size, p.Size)
 	}
 
-	// 平铺到 outDir, 处理重名
-	baseName := filepath.Base(remoteName)
-	localPath := uniquePath(outDir, baseName)
-
-	out, err := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	out, err := os.OpenFile(p.LocalPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	defer out.Close()
 
+	if p.Offset > 0 {
+		if _, err := out.Seek(p.Offset, io.SeekStart); err != nil {
+			return 0, err
+		}
+	}
+
+	remaining := p.Size - p.Offset
 	start := time.Now()
 	var received int64
 	buf := make([]byte, 64*1024)
 	lastUpdate := time.Now()
 
-	for received < size {
+	for received < remaining {
 		want := int64(len(buf))
-		if size-received < want {
-			want = size - received
+		if remaining-received < want {
+			want = remaining - received
 		}
 		// 单次读超时, 服务端异常时客户端不会永久阻塞
 		conn.SetReadDeadline(time.Now().Add(clientReadTimeout))
 		n, err := io.ReadFull(conn, buf[:want])
 		if n > 0 {
 			if _, werr := out.Write(buf[:n]); werr != nil {
-				return "", 0, werr
+				return received, werr
 			}
 			received += int64(n)
 			if time.Since(lastUpdate) >= 1000*time.Millisecond {
-				printProgress(baseName, received, size, start)
+				printProgress(remoteName, p.Offset+received, p.Size, start)
 				lastUpdate = time.Now()
 			}
 		}
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				if received < size {
-					return "", 0, fmt.Errorf("连接提前关闭: 收到 %d/%d 字节", received, size)
+				if received < remaining {
+					return received, fmt.Errorf("连接提前关闭: 收到 %d/%d 字节",
+						received, remaining)
 				}
 				break
 			}
-			return "", 0, err
+			return received, err
 		}
 	}
 	conn.SetReadDeadline(time.Time{})
-	printProgress(baseName, received, size, start)
+	printProgress(remoteName, p.Offset+received, p.Size, start)
 	fmt.Println()
-	return localPath, received, nil
+	return received, nil
 }
 
 func writeAckDone(conn *kcp.UDPSession) {
@@ -563,26 +676,15 @@ func writeAckDone(conn *kcp.UDPSession) {
 	time.Sleep(1 * time.Second)
 }
 
-// uniquePath 在 dir 下为 baseName 找一个不冲突的名字:
-//
-//	a.bin -> a_1.bin -> a_2.bin -> ...
-func uniquePath(dir, baseName string) string {
-	ext := filepath.Ext(baseName)
-	stem := strings.TrimSuffix(baseName, ext)
-	if stem == "" {
-		stem = baseName
-		ext = ""
+// sendCancel 发送 count=0 空请求, 通知服务端本次会话取消.
+func sendCancel(conn *kcp.UDPSession) {
+	req := make([]byte, 4)
+	binary.BigEndian.PutUint32(req[0:4], 0)
+	if _, err := conn.Write(req); err != nil {
+		log.Printf("发送取消请求失败: %v", err)
 	}
-	candidate := filepath.Join(dir, baseName)
-	if _, err := os.Stat(candidate); os.IsNotExist(err) {
-		return candidate
-	}
-	for i := 1; ; i++ {
-		candidate = filepath.Join(dir, fmt.Sprintf("%s_%d%s", stem, i, ext))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
+	// 给取消请求一点时间通过 KCP 送达服务端
+	time.Sleep(500 * time.Millisecond)
 }
 
 func printProgress(name string, done, total int64, start time.Time) {
