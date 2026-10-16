@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	defaultPort      = 12080
+	defaultPort      = 13080
 	defaultFECData   = 0 // 由于丢包率过高, 因此不开启FEC
 	defaultFECParity = 0
 	defaultInterval  = 10
