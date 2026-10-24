@@ -160,16 +160,17 @@ func runServer(rootPath string, minSizeMiB int64, port int, cfg KCPConfig) {
 	log.Printf("KCP 服务端监听 %s (FEC %d/%d, window=%d, mtu=%d)",
 		listenAddr, cfg.FECData, cfg.FECParity, cfg.Window, cfg.MTU)
 
-	for {
+	// for {
+	// 服务端只接受一次请求, 传输结束直接退出
 		conn, err := lis.AcceptKCP()
 		if err != nil {
 			log.Printf("Accept 错误: %v", err)
-			continue
+			// continue
 		}
 		log.Printf("客户端连接: %s", conn.RemoteAddr())
 		handleClient(conn, files, cfg)
 		log.Printf("客户端断开: %s", conn.RemoteAddr())
-	}
+	// }
 }
 
 func scanFiles(root string, minSize int64) ([]FileEntry, error) {
