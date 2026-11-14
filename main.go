@@ -25,7 +25,7 @@ const (
 	defaultResend    = 2
 	defaultNoDelay   = 1
 	defaultNC        = 1
-	defaultWindow    = 1024
+	defaultWindow    = 512
 	defaultMTU       = 1400
 
 	maxNameLen   = 65535
@@ -162,14 +162,14 @@ func runServer(rootPath string, minSizeMiB int64, port int, cfg KCPConfig) {
 
 	// for {
 	// 服务端只接受一次请求, 传输结束直接退出
-		conn, err := lis.AcceptKCP()
-		if err != nil {
-			log.Printf("Accept 错误: %v", err)
-			// continue
-		}
-		log.Printf("客户端连接: %s", conn.RemoteAddr())
-		handleClient(conn, files, cfg)
-		log.Printf("客户端断开: %s", conn.RemoteAddr())
+	conn, err := lis.AcceptKCP()
+	if err != nil {
+		log.Printf("Accept 错误: %v", err)
+		// continue
+	}
+	log.Printf("客户端连接: %s", conn.RemoteAddr())
+	handleClient(conn, files, cfg)
+	log.Printf("客户端断开: %s", conn.RemoteAddr())
 	// }
 }
 
@@ -435,13 +435,17 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 
 	fmt.Println()
 	fmt.Printf("服务端文件列表 (共 %d 个):\n", len(files))
+	var listTotal int64
 	for i, f := range files {
 		fmt.Printf("  [%d] %-60s %10.2f MiB\n",
 			i+1, f.RelPath, float64(f.Size)/1024/1024)
+		listTotal += f.Size
 	}
+	fmt.Printf("\n总计: %d 个文件, %d 字节 (%s)\n",
+		len(files), listTotal, humanSize(listTotal))
 
 	// 用户输入
-	fmt.Print("\n输入序号 (空格分隔, q 退出): ")
+	fmt.Print("\n输入序号 (空格分隔, 支持 1-4 范围与 all, q 退出): ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -453,34 +457,21 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		return
 	}
 
-	// 解析序号
-	parts := strings.Fields(line)
-	var seqs []uint32
-	seen := make(map[int]bool)
-	for _, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			log.Fatalf("非法序号: %s", p)
-		}
-		if n < 1 || n > len(files) {
-			log.Fatalf("序号越界: %d (有效范围 1-%d)", n, len(files))
-		}
-		if seen[n] {
-			continue
-		}
-		seen[n] = true
-		seqs = append(seqs, uint32(n-1))
-	}
-	if len(seqs) == 0 {
-		log.Fatal("未选择任何文件")
+	// 解析序号 (支持 1-4 范围与 all)
+	seqs, err := parseSelection(line, len(files))
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	// 本地预检: 计算每个选中文件的 localPath / offset, 跳过已完成或异常的
 	fmt.Println()
 	var pendingFiles []pending
 	var doneCount, warnCount int
+	var selectedTotalSize, alreadyHaveSize, pendingBytes int64
 	for _, s := range seqs {
 		f := files[s]
+		selectedTotalSize += f.Size
+
 		baseName := filepath.Base(f.RelPath)
 		localPath := filepath.Join(outDir, baseName)
 
@@ -492,6 +483,7 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		switch {
 		case localSize == f.Size:
 			fmt.Printf("  - 跳过 %s (本地已完成, %d 字节)\n", f.RelPath, localSize)
+			alreadyHaveSize += localSize
 			doneCount++
 			continue
 		case localSize > f.Size:
@@ -500,6 +492,8 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 			warnCount++
 			continue
 		default:
+			alreadyHaveSize += localSize
+			pendingBytes += f.Size - localSize
 			pendingFiles = append(pendingFiles, pending{
 				Seq:       s,
 				Offset:    localSize,
@@ -510,12 +504,23 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		}
 	}
 
+	// 输出选中文件的累计字节数 (改动 3)
+	fmt.Printf("\n选中 %d 个文件, 总计 %d 字节 (%s)\n",
+		len(seqs), selectedTotalSize, humanSize(selectedTotalSize))
+
 	if len(pendingFiles) == 0 {
 		// 所有选中文件都已完成或被跳过, 通知服务端取消
 		sendCancel(conn)
-		fmt.Printf("\n无需下载 (已完成 %d, 跳过 %d)\n", doneCount, warnCount)
+		fmt.Printf("无需下载 (已完成 %d, 跳过 %d)\n", doneCount, warnCount)
 		return
 	}
+
+	fmt.Printf("本次需传输 %d 个文件, %d 字节 (%s)",
+		len(pendingFiles), pendingBytes, humanSize(pendingBytes))
+	if doneCount > 0 || warnCount > 0 {
+		fmt.Printf(" (已完成 %d 个, 跳过 %d 个)", doneCount, warnCount)
+	}
+	fmt.Println()
 
 	// 发送请求: [count:4] + [seq:4][offset:8]*count
 	req := make([]byte, 4+12*len(pendingFiles))
@@ -528,8 +533,7 @@ func runClient(host string, port int, outDir string, cfg KCPConfig) {
 		log.Fatal("发送请求失败: ", err)
 	}
 
-	fmt.Printf("\n开始下载 %d 个文件 (已完成 %d, 跳过 %d)...\n\n",
-		len(pendingFiles), doneCount, warnCount)
+	fmt.Println("\n开始下载...")
 
 	startAll := time.Now()
 	var totalBytes int64
@@ -742,4 +746,114 @@ func formatTime(sec float64) string {
 	m := int(sec) / 60
 	s := int(sec) % 60
 	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+// humanSize 将字节数格式化为人性化字符串 (保留 2 位小数).
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), units[exp+1])
+}
+
+// parseSelection 解析用户选择, 返回从 0 开始的序号列表 (保持首次出现顺序, 自动去重).
+// 支持:
+//   - 单个序号, 如 "3"
+//   - 闭区间范围, 如 "1-4"
+//   - "all" (表示全部), 且不能与其他 token 混用
+//
+// 严格模式: 反向范围 / 范围带空格 / 越界 / all 混用 / 非法 token 均返回错误.
+func parseSelection(line string, total int) ([]uint32, error) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil, fmt.Errorf("未选择任何文件")
+	}
+
+	// all 单独出现 = 全选
+	if strings.EqualFold(trimmed, "all") {
+		seqs := make([]uint32, total)
+		for i := 0; i < total; i++ {
+			seqs[i] = uint32(i)
+		}
+		return seqs, nil
+	}
+
+	parts := strings.Fields(trimmed)
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("未选择任何文件")
+	}
+
+	var seqs []uint32
+	seen := make(map[int]bool)
+	appendOne := func(n int) error {
+		if n < 1 || n > total {
+			return fmt.Errorf("序号越界: %d (有效范围 1-%d)", n, total)
+		}
+		if seen[n] {
+			return nil
+		}
+		seen[n] = true
+		seqs = append(seqs, uint32(n-1))
+		return nil
+	}
+
+	for _, p := range parts {
+		if strings.EqualFold(p, "all") {
+			return nil, fmt.Errorf("all 不能与其他序号混用")
+		}
+
+		if strings.Contains(p, "-") {
+			// 注意: "1 - 4" 会被 Fields 拆成 "1" "-" "4",
+			// 走到这里时 p="-", 下面的空判断会捕获它.
+			pair := strings.SplitN(p, "-", 2)
+			if len(pair) != 2 {
+				return nil, fmt.Errorf("非法范围: %s", p)
+			}
+			a, b := pair[0], pair[1]
+			if a == "" || b == "" {
+				// 捕获 "1-" / "-4" / "-" (即 "1 - 4" 的中间 token)
+				return nil, fmt.Errorf("非法范围: %s", p)
+			}
+			if strings.Contains(b, "-") {
+				// 捕获 "1-2-3"
+				return nil, fmt.Errorf("非法范围: %s", p)
+			}
+			start, err := strconv.Atoi(a)
+			if err != nil {
+				return nil, fmt.Errorf("非法范围起点: %s", a)
+			}
+			end, err := strconv.Atoi(b)
+			if err != nil {
+				return nil, fmt.Errorf("非法范围终点: %s", b)
+			}
+			if start > end {
+				return nil, fmt.Errorf("非法范围 (起点大于终点): %s", p)
+			}
+			for i := start; i <= end; i++ {
+				if err := appendOne(i); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			n, err := strconv.Atoi(p)
+			if err != nil {
+				return nil, fmt.Errorf("非法序号: %s", p)
+			}
+			if err := appendOne(n); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if len(seqs) == 0 {
+		return nil, fmt.Errorf("未选择任何文件")
+	}
+	return seqs, nil
 }
