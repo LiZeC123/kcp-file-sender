@@ -155,15 +155,13 @@ KCP 内置 Reed-Solomon 前向纠错（FEC）。参数 `(dataShard, parityShard)
 ### 编译
 
 ```bash
-go mod init kcp-file-sender
-go get github.com/xtaci/kcp-go/v5@latest
-go build -o kcpfile main.go
+go build
 ```
 
 ### 服务端
 
 ```bash
-./kcpfile -mode server -path /data/files -minsize 200 -port 13080
+./kcp-file-sender -mode server -path /data/files -minsize 200 -port 13080
 ```
 
 - `-path`：扫描根目录（递归）
@@ -173,7 +171,7 @@ go build -o kcpfile main.go
 ### 客户端
 
 ```bash
-./kcpfile -mode client -server <serverIP> -port 13080 -out ./downloads
+./kcp-file-sender -mode client -server <serverIP> -port 13080 -out ./downloads
 ```
 
 - `-server`：服务端地址
