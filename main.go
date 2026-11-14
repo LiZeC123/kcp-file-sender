@@ -85,7 +85,7 @@ func main() {
 	mode := flag.String("mode", "", "server 或 client")
 
 	// server
-	rootPath := flag.String("path", "", "server: 扫描的根路径")
+	rootPath := flag.String("path", ".", "server: 扫描的根路径")
 	minSizeMiB := flag.Int64("minsize", 0, "server: 最小文件大小 (MiB)")
 	port := flag.Int("port", defaultPort, "监听/连接端口")
 
