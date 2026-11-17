@@ -82,11 +82,10 @@ type pending struct {
 }
 
 func main() {
-	mode := flag.String("mode", "", "server 或 client")
-
 	// server
 	rootPath := flag.String("path", ".", "server: 扫描的根路径")
-	minSizeMiB := flag.Int64("minsize", 0, "server: 最小文件大小 (MiB)")
+	// 默认最小文件大小为60MB
+	minSizeMiB := flag.Int64("minsize", 60, "server: 最小文件大小 (MiB)")
 	port := flag.Int("port", defaultPort, "监听/连接端口")
 
 	// client
@@ -116,19 +115,12 @@ func main() {
 		MTU:       *mtu,
 	}
 
-	switch *mode {
-	case "server":
-		if *rootPath == "" {
-			log.Fatal("server 模式需要 -path 参数")
-		}
-		runServer(*rootPath, *minSizeMiB, *port, cfg)
-	case "client":
-		if *serverHost == "" {
-			log.Fatal("client 模式需要 -server 参数")
-		}
+	// 默认是server模式, 如果指定了服务端地址则为client模式
+	if *serverHost != "" {
+		// 客户端模式
 		runClient(*serverHost, *port, *outDir, cfg)
-	default:
-		log.Fatal("需要 -mode server 或 -mode client")
+	} else {
+		runServer(*rootPath, *minSizeMiB, *port, cfg)
 	}
 }
 
