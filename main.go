@@ -36,9 +36,15 @@ const (
 	// 服务端等待客户端完成确认的超时
 	serverAckTimeout = 120 * time.Second
 	// 服务端读取客户端请求 (请求头 + 文件序号 + offset) 的超时
-	serverRequestTimeout = 120 * time.Second
+	// 设置为一个相当宽裕的时间, 以便于用户有足够的时间确认选择情况
+	serverRequestTimeout = 600 * time.Second
+	
+	// 服务端单次写入数据的超时时间, 客户端异常时服务端会在写入处阻塞, 设置超时时间从而结束整个程序
+	serverWriteTimeout = 60 * time.Second
+
 	// 客户端在 recvFile 中的单次读超时, 避免服务端异常时永久阻塞
-	clientReadTimeout = 120 * time.Second
+	// 和服务端的超时时间保持一致
+	clientReadTimeout = serverWriteTimeout
 )
 
 // ---------------- 参数 ----------------
@@ -334,7 +340,7 @@ func sendFileList(conn io.Writer, files []FileEntry) error {
 
 // sendFileFrom 从 offset 开始发送文件.
 // 文件头始终携带文件总大小, 便于客户端校验与进度显示.
-func sendFileFrom(conn io.Writer, f FileEntry, offset int64) (int64, error) {
+func sendFileFrom(conn *kcp.UDPSession, f FileEntry, offset int64) (int64, error) {
 	file, err := os.Open(f.AbsPath)
 	if err != nil {
 		return 0, err
@@ -363,10 +369,9 @@ func sendFileFrom(conn io.Writer, f FileEntry, offset int64) (int64, error) {
 	buf := make([]byte, 64*1024)
 	lastLog := start
 	for sent < remaining {
-		want := int64(len(buf))
-		if remaining-sent < want {
-			want = remaining - sent
-		}
+		want := min(remaining - sent, int64(len(buf)))
+		// 单次写入超时, 客户端异常时服务端不会永远阻塞
+		conn.SetWriteDeadline(time.Now().Add(serverWriteTimeout))
 		n, err := file.Read(buf[:want])
 		if n > 0 {
 			if _, werr := conn.Write(buf[:n]); werr != nil {
@@ -391,6 +396,7 @@ func sendFileFrom(conn io.Writer, f FileEntry, offset int64) (int64, error) {
 		}
 	}
 
+	conn.SetWriteDeadline(time.Time{})
 	elapsed := time.Since(start)
 	log.Printf("  ↑ %s 完成: 本次发送 %d 字节 (offset=%d, 累计 %d/%d), %.2fs, 平均 %.2f MiB/s",
 		f.RelPath, sent, offset, offset+sent, f.Size, elapsed.Seconds(),
@@ -631,10 +637,7 @@ func recvFileAt(conn *kcp.UDPSession, p pending) (int64, error) {
 	lastUpdate := time.Now()
 
 	for received < remaining {
-		want := int64(len(buf))
-		if remaining-received < want {
-			want = remaining - received
-		}
+		want := min(remaining - received, int64(len(buf)))
 		// 单次读超时, 服务端异常时客户端不会永久阻塞
 		conn.SetReadDeadline(time.Now().Add(clientReadTimeout))
 		n, err := io.ReadFull(conn, buf[:want])
